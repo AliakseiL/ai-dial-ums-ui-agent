@@ -27,7 +27,6 @@ class ConversationManager:
 
     async def create_conversation(self, title: str) -> dict:
         """Create a new conversation"""
-        #TODO:
         # 1. Create conversation id `str(uuid.uuid4())`
         # 2. Create current datatime `datetime.now(UTC).isoformat()`
         # 3. Create `conversation` dict with:
@@ -44,11 +43,23 @@ class ConversationManager:
         #       - {conversation_id: datetime.now(UTC).timestamp()}
         # 6. Log the conversation info
         # 7. Return conversation
-        raise NotImplementedError()
+
+        conversation_id = str(uuid.uuid4())
+        current_time = datetime.now(UTC).isoformat()
+        conversation = {
+            "id": conversation_id,
+            "title": title,
+            "messages": [],
+            "created_at": current_time,
+            "updated_at": current_time
+        }
+        await self.redis.set(f"{CONVERSATION_PREFIX}{conversation_id}", json.dumps(conversation))
+        await self.redis.zadd(CONVERSATION_LIST_KEY, {conversation_id: datetime.now(UTC).timestamp()})
+        logger.info("Created new conversation", extra={"conversation": conversation})
+        return conversation
 
     async def list_conversations(self) -> list[dict]:
         """List all conversations sorted by last update time"""
-        #TODO:
         # 1. Get `conversation_ids` with `await self.redis.zrevrange(CONVERSATION_LIST_KEY, 0, -1)`
         # 2. Create empty list as `conversations`
         # 3. Iterate through `conversation_ids` and:
@@ -62,23 +73,42 @@ class ConversationManager:
         #               - updated_at - conv["updated_at"]
         #               - message_count - len(conv["messages"])
         # 4. return conversations
-        raise NotImplementedError()
+
+        conversation_ids = await self.redis.zrevrange(CONVERSATION_LIST_KEY, 0, -1)
+        conversations = []
+        for conversation_id in conversation_ids:
+            conv_data = await self.redis.get(f"{CONVERSATION_PREFIX}{conversation_id}")
+            if conv_data:
+                conv = json.loads(conv_data)
+                conversations.append({
+                    "id": conv["id"],
+                    "title": conv["title"],
+                    "created_at": conv["created_at"],
+                    "updated_at": conv["updated_at"],
+                    "message_count": len(conv["messages"])
+                })
+        return conversations
 
     async def get_conversation(self, conversation_id: str) -> Optional[dict]:
         """Get a specific conversation"""
-        #TODO:
         # 1. Get conversation from redis, use CONVERSATION_PREFIX before conversation_id (don't forget to await, it is async)
         # 2. If nothing found then return None
         # 3. Load it with json (json.loads)
         # 4. return conversation
-        raise NotImplementedError()
+
+        conv_data = await self.redis.get(f"{CONVERSATION_PREFIX}{conversation_id}")
+        if not conv_data:
+            return None
+        conversation = json.loads(conv_data)
+        return conversation
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation"""
-        #TODO:
         # 1. Call delete conversation in redis, use CONVERSATION_PREFIX before conversation_id (don't forget to await, it is async)
         # 2. Id nothing was deleted then return False, otherwise True
-        raise NotImplementedError()
+
+        deleted_count = await self.redis.delete(f"{CONVERSATION_PREFIX}{conversation_id}")
+        return deleted_count > 0
 
     async def chat(
             self,
@@ -90,7 +120,6 @@ class ConversationManager:
         Process chat messages and return AI response.
         Automatically saves conversation state.
         """
-        #TODO:
         # 1. Log request
         # 2. Get conversation (use method `get_conversation`)
         # 3. Raise an error that no conversation foud if conversation is not present
@@ -98,7 +127,19 @@ class ConversationManager:
         # 5. If `messages` array is empty it means that it is beginning of the conversation. Add system prompt as 1st message
         # 6. Agge `user_message` to `messages` array
         # 7. If `stream` is true then call `_stream_chat` (without await!), otherwise call `_non_stream_chat` (with await) and return it
-        raise NotImplementedError()
+
+        logger.info("Chat request received", extra={"conversation_id": conversation_id, "stream": stream})
+        conversation = await self.get_conversation(conversation_id)
+        if not conversation:
+            raise ValueError(f"No conversation found with id: {conversation_id}")
+        messages = [Message(**msg_data) for msg_data in conversation.get("messages", [])]
+        if not messages:
+            messages.append(Message(role=Role.SYSTEM, content=SYSTEM_PROMPT))
+        messages.append(user_message)
+        if stream:
+            return self._stream_chat(conversation_id, messages)
+        else:
+            return await self._non_stream_chat(conversation_id, messages)
 
 
     async def _stream_chat(
@@ -107,13 +148,16 @@ class ConversationManager:
             messages: list[Message],
     ) -> AsyncGenerator[str, None]:
         """Handle streaming chat with automatic saving"""
-        #TODO:
         # 1. Send conversation_id first: `yield f"data: {json.dumps({'conversation_id': conversation_id})}\n\n"`
         # 2. Stream the response - full_messages will be modified by dial_client:
         #       `async for chunk in self.dial_client.stream_response(messages):
         #           yield chunk`
         # 3. Save conversation (`_save_conversation_messages` method, don't forget to await)
-        raise NotImplementedError()
+
+        yield f"data: {json.dumps({'conversation_id': conversation_id})}\n\n"
+        async for chunk in self.dial_client.stream_response(messages):
+            yield chunk
+        await self._save_conversation_messages(conversation_id, messages)
 
     async def _non_stream_chat(
             self,
@@ -121,13 +165,18 @@ class ConversationManager:
             messages: list[Message],
     ) -> dict:
         """Handle non-streaming chat"""
-        #TODO:
         # 1. Call `await self.dial_client.response(messages)`
         # 2. Save conversation (`_save_conversation_messages` method, don't forget to await)
         # 3. Return dict with:
         #       - "content": ai_message.content or ''
         #       - "conversation_id": conversation_id
-        raise NotImplementedError()
+
+        ai_message = await self.dial_client.response(messages)
+        await self._save_conversation_messages(conversation_id, messages)
+        return {
+            "content": ai_message.content or '',
+            "conversation_id": conversation_id
+        }
 
     async def _save_conversation_messages(
             self,
@@ -135,17 +184,20 @@ class ConversationManager:
             messages: list[Message]
     ):
         """Save or update conversation messages"""
-        #TODO:
         # 1. Get conversation from redis, use CONVERSATION_PREFIX before conversation_id (don't forget to await, it is async)
         # 2. Load it with json (json.loads) as `conversation`
         # 3. Create list with messages dits (use `model_dump` method) and it set `conversation` 'messages'
         # 4. Update `updated_at` time with `datetime.now(UTC).isoformat()` in `conversation`
         # 5. Save it with `_save_conversation` method
-        raise NotImplementedError()
+
+        conv_data = await self.redis.get(f"{CONVERSATION_PREFIX}{conversation_id}")
+        conversation = json.loads(conv_data)
+        conversation['messages'] = [msg.model_dump() for msg in messages]
+        conversation['updated_at'] = datetime.now(UTC).isoformat()
+        await self._save_conversation(conversation)
 
     async def _save_conversation(self, conversation: dict):
         """Internal method to persist conversation to Redis"""
-        #TODO:
         # 1. Get conversation id
         # 2. Call redis set with:
         #       - f"{CONVERSATION_PREFIX}{conversation_id}"
@@ -153,4 +205,7 @@ class ConversationManager:
         # 3. Call redis zadd with:
         #       - CONVERSATION_LIST_KEY
         #       - {conversation_id: datetime.now(UTC).timestamp()}
-        raise NotImplementedError()
+
+        conversation_id = conversation['id']
+        await self.redis.set(f"{CONVERSATION_PREFIX}{conversation_id}", json.dumps(conversation))
+        await self.redis.zadd(CONVERSATION_LIST_KEY, {conversation_id: datetime.now(UTC).timestamp()})

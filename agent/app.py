@@ -50,21 +50,61 @@ async def lifespan(app: FastAPI):
     # 8. Create Redis client (redis.Redis). Host is localhost, port is 6379, and decode response
     # 9. ping to redis to check if `its alive (ping method in redis client)
     # 10. Create ConversationManager with DIAL clien and Redis client and assign to `conversation_manager` (global variable)
+
+    tools = []
+    tool_name_client_map = {}
+    ums_mcp_client = await HttpMCPClient.create(mcp_server_url="http://localhost:8005/mcp")
+    ums_tools = await ums_mcp_client.get_tools()
+    for tool in ums_tools:
+        tools.append(tool)
+        tool_name_client_map[tool['function']['name']] = ums_mcp_client
+
+   # fetch_mcp_client = await HttpMCPClient.create(mcp_server_url="https://remote.mcpservers.org/fetch/mcp")
+  #  fetch_tools = await fetch_mcp_client.get_tools()
+  #  for tool in fetch_tools:
+    #    tools.append(tool)
+    #    tool_name_client_map[tool['function']['name']] = fetch_mcp_client
+
+    duckduckgo_mcp_client = await StdioMCPClient.create(docker_image="mcp/duckduckgo:latest")
+    duckduckgo_tools = await duckduckgo_mcp_client.get_tools()
+    for tool in duckduckgo_tools:
+        tools.append(tool)
+        tool_name_client_map[tool['function']['name']] = duckduckgo_mcp_client
+
+    dial_client = DialClient(
+        api_key=os.getenv("DIAL_API_KEY"),
+        endpoint="https://ai-proxy.lab.epam.com",
+        model="gpt-4o",
+        tools=tools,
+        tool_name_client_map=tool_name_client_map
+    )
+    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+    await redis_client.ping()
+    conversation_manager = ConversationManager(dial_client=dial_client, redis_client=redis_client)
+
     yield
+
+    logger.info("Application shutdown initiated")
+    await redis_client.close()
 
 
 app = FastAPI(
     #TODO: add `lifespan` param from above, like:
     # - lifespan=lifespan
+    lifespan=lifespan
 )
 app.add_middleware(
-    #TODO:
     # Since we will run it locally there will be some issues from FrontEnd side with CORS, and its okay for local setup to disable them:
     #   - CORSMiddleware,
     #   - allow_origins=["*"]
     #   - allow_credentials=True
     #   - allow_methods=["*"]
     #   - allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -102,7 +142,6 @@ async def health():
     }
 
 
-#TODO:
 # Create such endpoints:
 # 1. POST: "/conversations". Applies CreateConversationRequest and creates new conversation.
 # 2. GET: "/conversations" Extracts all conversation from storage. Returns list of ConversationSummary objects
@@ -114,14 +153,112 @@ async def health():
 #    Applies conversation_id and ChatRequest.
 #    If `request.stream` then return `StreamingResponse(result, media_type="text/event-stream")`, otherwise return `ChatResponse(**result)`
 
+@app.post("/conversations", response_model=ConversationSummary)
+async def create_conversation(request: CreateConversationRequest):
+    """Create a new conversation"""
+    if conversation_manager is None:
+        logger.error("Conversation manager is not initialized")
+        raise HTTPException(status_code=500, detail="Conversation manager is not initialized")
+
+    conversation = await conversation_manager.create_conversation(title=request.title)
+    logger.info(f"Created new conversation with id: {conversation['id']}")
+    return ConversationSummary(
+        id=conversation['id'],
+        title=conversation['title'],
+        created_at=conversation['created_at'],
+        updated_at=conversation['updated_at'],
+        message_count=len(conversation['messages'])
+    )
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+async def get_conversations():
+    """Get all conversations"""
+    if conversation_manager is None:
+        logger.error("Conversation manager is not initialized")
+        raise HTTPException(status_code=500, detail="Conversation manager is not initialized")
+
+    conversations = await conversation_manager.list_conversations()
+    logger.info(f"Retrieved {len(conversations)} conversations")
+    return [
+        ConversationSummary(
+            id=conv['id'],
+            title=conv['title'],
+            created_at=conv['created_at'],
+            updated_at=conv['updated_at'],
+            message_count=conv['message_count']
+        ) for conv in conversations
+    ]
+
+@app.get("/conversations/{conversation_id}", response_model=dict)
+async def get_conversation(conversation_id: str):
+    """Get a specific conversation"""
+    if conversation_manager is None:
+        logger.error("Conversation manager is not initialized")
+        raise HTTPException(status_code=500, detail="Conversation manager is not initialized")
+
+    conversation = await conversation_manager.get_conversation(conversation_id)
+    if conversation is None:
+        logger.warning(f"Conversation with id {conversation_id} not found")
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    logger.info(f"Retrieved conversation with id: {conversation_id}")
+    return conversation
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation"""
+    if conversation_manager is None:
+        logger.error("Conversation manager is not initialized")
+        raise HTTPException(status_code=500, detail="Conversation manager is not initialized")
+
+    deleted = await conversation_manager.delete_conversation(conversation_id)
+    if not deleted:
+        logger.warning(f"Conversation with id {conversation_id} not found for deletion")
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    logger.info(f"Deleted conversation with id: {conversation_id}")
+    return {"message": "Conversation successfully deleted"}
+
+@app.post("/conversations/{conversation_id}/chat", response_model=ChatResponse)
+async def chat(conversation_id: str, request: ChatRequest):
+    """Chat endpoint to process messages"""
+    if conversation_manager is None:
+        logger.error("Conversation manager is not initialized")
+        raise HTTPException(status_code=500, detail="Conversation manager is not initialized")
+
+    if request.stream:
+        result = await conversation_manager.chat(
+            user_message=request.message,
+            conversation_id=conversation_id,
+            stream=request.stream
+        )
+
+        logger.info(f"Streaming chat response for conversation id: {conversation_id}")
+        return StreamingResponse(result, media_type="text/event-stream")
+    else:
+        result = await conversation_manager.chat(
+            user_message=request.message,
+            conversation_id=conversation_id,
+            stream=False
+        )
+        logger.info(f"Returning chat response for conversation id: {conversation_id}")
+        return ChatResponse(
+            content=result['content'],
+            conversation_id=result['conversation_id']
+        )
+
+
 
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting UMS Agent server")
     uvicorn.run(
-        #TODO:
         #  - app
         #  - host="0.0.0.0"
         #  - port=8011
         #  - log_level="debug"
+        app,
+        host="0.0.0.0",
+        port=8011,
+        log_level="debug"
     )
